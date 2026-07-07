@@ -1,0 +1,393 @@
+import { GenerateAssistantResponseCommand } from '@aws/codewhisperer-streaming-client';
+import { THINKING_BUDGETS } from '../../constants.js';
+import { isPermanentError } from '../../plugin/health.js';
+import { imageCache } from '../../plugin/image-cache.js';
+import * as logger from '../../plugin/logger.js';
+import { transformToSdkRequest } from '../../plugin/request.js';
+import { createSdkClient } from '../../plugin/sdk-client.js';
+import { kiroDb } from '../../plugin/storage/sqlite.js';
+import { syncFromKiroCli } from '../../plugin/sync/kiro-cli.js';
+import { AccountSelector } from '../account/account-selector.js';
+import { UsageTracker } from '../account/usage-tracker.js';
+import { TokenRefresher } from '../auth/token-refresher.js';
+import { ErrorHandler } from './error-handler.js';
+import { ResponseHandler } from './response-handler.js';
+import { RetryStrategy } from './retry-strategy.js';
+// Matches both the standard q.amazonaws.com endpoint and the Pro runtime.kiro.dev endpoint
+const KIRO_API_PATTERN = /^(https?:\/\/)?(q\.[a-z0-9-]+\.amazonaws\.com|runtime\.[a-z0-9-]+\.kiro\.dev)/;
+const REAUTH_FAILURE_COOLDOWN_MS = 60000;
+const REAUTH_TIMEOUT_MS = 90_000;
+function extractSessionId(headers) {
+    if (!headers)
+        return undefined;
+    const h = headers;
+    return h['x-session-id'] ?? h['x-session-affinity'];
+}
+export class RequestHandler {
+    accountManager;
+    config;
+    repository;
+    client;
+    workspace;
+    accountSelector;
+    tokenRefresher;
+    errorHandler;
+    responseHandler;
+    usageTracker;
+    retryStrategy;
+    reauthInFlight = null;
+    lastFailedReauthAt = 0;
+    constructor(accountManager, config, repository, client, workspace = '') {
+        this.accountManager = accountManager;
+        this.config = config;
+        this.repository = repository;
+        this.client = client;
+        this.workspace = workspace;
+        this.accountSelector = new AccountSelector(accountManager, config, syncFromKiroCli, repository);
+        this.tokenRefresher = new TokenRefresher(config, accountManager, syncFromKiroCli, repository);
+        this.errorHandler = new ErrorHandler(config, accountManager, repository);
+        this.responseHandler = new ResponseHandler();
+        this.usageTracker = new UsageTracker(config, accountManager, repository);
+        this.retryStrategy = new RetryStrategy(config);
+    }
+    async handle(input, init, showToast) {
+        const url = typeof input === 'string' ? input : input.url;
+        if (!KIRO_API_PATTERN.test(url)) {
+            return fetch(input, init);
+        }
+        const sessionId = extractSessionId(init?.headers);
+        return this.handleKiroRequest(url, init, showToast, sessionId);
+    }
+    async handleKiroRequest(url, init, showToast, sessionId) {
+        const body = init?.body ? JSON.parse(init.body) : {};
+        const model = this.extractModel(url) || body.model || 'claude-sonnet-4-5';
+        // Resolve thinking mode + budget.
+        //
+        // Priority order:
+        //   1. Model ID ends with '-thinking'  → adaptive thinking, default budget
+        //   2. providerOptions["kiro"].reasoningEffort  → adaptive mode, effort-based budget
+        //      (OpenCode sends this when the user picks low/medium/high in the UI)
+        //   3. providerOptions.thinkingConfig.thinkingBudget → explicit budget (legacy)
+        //
+        // Budget mapping (Kiro max = 200 000 tokens):
+        //   low → 10 000 | medium → 24 000 | high → 200 000 | default → 16 000
+        const provOpts = body.providerOptions?.['kiro'] ?? body.providerOptions ?? {};
+        const reasoningEffort = provOpts.reasoningEffort;
+        const thinkingConfig = body.providerOptions?.thinkingConfig;
+        const think = model.endsWith('-thinking') || !!reasoningEffort || !!thinkingConfig;
+        let uiEffort = 'default';
+        if (reasoningEffort === 'low')
+            uiEffort = 'low';
+        else if (reasoningEffort === 'medium')
+            uiEffort = 'medium';
+        else if (reasoningEffort === 'high')
+            uiEffort = 'high';
+        const budget = thinkingConfig?.thinkingBudget || THINKING_BUDGETS[uiEffort];
+        let retry = 0;
+        let bearerRetried = false;
+        let consecutiveNullAccounts = 0;
+        let forceNewConversation = false;
+        const retryContext = this.retryStrategy.createContext();
+        while (true) {
+            const check = this.retryStrategy.shouldContinue(retryContext);
+            if (!check.canContinue) {
+                throw new Error(check.error);
+            }
+            if (this.allAccountsPermanentlyUnhealthy()) {
+                const reauthed = await this.triggerReauth(showToast);
+                if (!reauthed) {
+                    throw new Error('All accounts are permanently unhealthy. Please re-authenticate.');
+                }
+                continue;
+            }
+            let acc = await this.accountSelector.selectHealthyAccount(showToast).catch(async (e) => {
+                if (e instanceof Error && e.message.includes('reauth required')) {
+                    const reauthed = await this.triggerReauth(showToast);
+                    if (!reauthed)
+                        throw new Error('All accounts are unhealthy or rate-limited. Please re-authenticate.');
+                    return null;
+                }
+                throw e;
+            });
+            if (!acc) {
+                consecutiveNullAccounts++;
+                const backoffDelay = Math.min(1000 * Math.pow(2, consecutiveNullAccounts - 1), 10000);
+                await this.sleep(backoffDelay);
+                continue;
+            }
+            consecutiveNullAccounts = 0;
+            const auth = this.accountManager.toAuthDetails(acc);
+            const tokenResult = await this.tokenRefresher.refreshIfNeeded(acc, auth, showToast);
+            if (tokenResult.shouldContinue) {
+                acc = tokenResult.account;
+                await this.sleep(500);
+                continue;
+            }
+            const sdkPrep = this.prepareSdkRequest(body, model, auth, think, budget, showToast, uiEffort, sessionId);
+            const histLen = sdkPrep.conversationState.history?.length || 0;
+            const agentContId = sdkPrep.conversationState.agentContinuationId || 'none';
+            logger.debug(`[REQ] convId=${sdkPrep.conversationId} history=${histLen} agentCont=${agentContId} model=${model}`);
+            const apiTimestamp = this.config.enable_log_api_request ? logger.getTimestamp() : null;
+            if (apiTimestamp) {
+                this.logSdkRequest(sdkPrep, acc, apiTimestamp);
+            }
+            try {
+                const client = createSdkClient(auth, sdkPrep.region, sdkPrep.effort);
+                const command = new GenerateAssistantResponseCommand({
+                    conversationState: sdkPrep.conversationState,
+                    profileArn: sdkPrep.profileArn
+                });
+                const sdkResponse = await client.send(command);
+                if (apiTimestamp) {
+                    this.logSdkResponse(sdkPrep, apiTimestamp);
+                }
+                this.handleSuccessfulRequest(acc);
+                this.usageTracker.syncUsage(acc, auth);
+                const result = await this.responseHandler.handleSdkSuccess(sdkResponse, model, sdkPrep.conversationId, sdkPrep.streaming, sdkPrep.toolNameMapper, think);
+                logger.debug(`[REQ] done convId=${sdkPrep.conversationId}`);
+                return result;
+            }
+            catch (e) {
+                logger.warn(`[REQ] error convId=${sdkPrep.conversationId}: ${e?.name || ''} ${e?.message?.slice(0, 200) || String(e).slice(0, 200)}`);
+                const httpStatus = e?.$metadata?.httpStatusCode;
+                if (httpStatus === 403 && !bearerRetried) {
+                    const msg = e?.message || '';
+                    if (msg.includes('bearer token included in the request is invalid') ||
+                        msg.includes('The bearer token included in the request is invalid')) {
+                        bearerRetried = true;
+                        logger.warn('403 bearer invalid on first attempt, forcing token refresh and retrying');
+                        await this.tokenRefresher.forceRefresh(acc, this.accountManager.toAuthDetails(acc));
+                        continue;
+                    }
+                }
+                if (httpStatus) {
+                    const mockResponse = new Response(JSON.stringify({ message: e.message, __type: e.name }), {
+                        status: httpStatus,
+                        statusText: e.name || 'Error',
+                        headers: { 'Content-Type': 'application/json' }
+                    });
+                    const errorResult = await this.errorHandler.handle(e, mockResponse, acc, { retry, excludedMs: retryContext.excludedMs }, showToast);
+                    if (errorResult.shouldRetry) {
+                        if (errorResult.newContext) {
+                            retry = errorResult.newContext.retry;
+                            const sleptMs = (errorResult.newContext.excludedMs ?? 0) - retryContext.excludedMs;
+                            if (sleptMs > 0)
+                                this.retryStrategy.markSleep(retryContext, sleptMs);
+                        }
+                        if (errorResult.forceRefresh) {
+                            await this.tokenRefresher.forceRefresh(acc, this.accountManager.toAuthDetails(acc));
+                        }
+                        if (errorResult.switchAccount) {
+                            continue;
+                        }
+                        continue;
+                    }
+                    if (httpStatus === 400 && e?.name === 'ValidationException' && !forceNewConversation) {
+                        const { workspace, fingerprint } = sdkPrep.conversationKey;
+                        kiroDb.deleteConversationId(workspace, fingerprint);
+                        // The conversation is starting fresh — drop any carried-forward
+                        // images too so the new convId doesn't inherit stale state.
+                        imageCache.delete(workspace, fingerprint);
+                        logger.warn(`[REQ] stale conversationId reset, retrying convId=${sdkPrep.conversationId}`);
+                        forceNewConversation = true;
+                        continue;
+                    }
+                    if (this.allAccountsPermanentlyUnhealthy()) {
+                        const reauthed = await this.triggerReauth(showToast);
+                        if (reauthed)
+                            continue;
+                    }
+                    if (apiTimestamp) {
+                        this.logSdkError(sdkPrep, e, acc, apiTimestamp);
+                    }
+                    throw new Error(`Kiro Error: ${httpStatus}`);
+                }
+                const networkResult = await this.errorHandler.handleNetworkError(e, { retry }, showToast);
+                if (networkResult.shouldRetry) {
+                    if (networkResult.newContext) {
+                        retry = networkResult.newContext.retry;
+                    }
+                    continue;
+                }
+                throw e;
+            }
+        }
+    }
+    extractModel(url) {
+        return url.match(/models\/([^/:]+)/)?.[1] || null;
+    }
+    prepareSdkRequest(body, model, auth, think, budget, showToast, _uiEffort = 'default', sessionId) {
+        return transformToSdkRequest(body, model, auth, think, budget, showToast, this.workspace, this.config.image_carry_forward, sessionId, { effort: this.config.effort, autoEffortMapping: this.config.auto_effort_mapping }, this.config.max_payload_bytes);
+    }
+    handleSuccessfulRequest(acc) {
+        // Only write to DB if the account was actually degraded — avoids a
+        // withDatabaseLock + full merge/dedup round-trip on every healthy request.
+        if (acc.failCount && acc.failCount > 0 && !isPermanentError(acc.unhealthyReason)) {
+            acc.failCount = 0;
+            acc.isHealthy = true;
+            delete acc.unhealthyReason;
+            delete acc.recoveryTime;
+            this.repository.save(acc).catch(() => { });
+        }
+    }
+    logSdkRequest(prep, acc, timestamp) {
+        this.logImageDiagnostic(prep);
+        logger.logApiRequest({
+            url: `${prep.endpoint}/generateAssistantResponse`,
+            method: 'POST',
+            headers: { 'x-amzn-kiro-agent-mode': 'vibe' },
+            body: {
+                conversationState: {
+                    chatTriggerType: prep.conversationState.chatTriggerType,
+                    conversationId: prep.conversationState.conversationId,
+                    historyLength: prep.conversationState.history?.length || 0,
+                    currentMessage: prep.conversationState.currentMessage
+                },
+                profileArn: prep.profileArn
+            },
+            conversationId: prep.conversationId,
+            model: prep.effectiveModel,
+            email: acc.email
+        }, timestamp);
+    }
+    logImageDiagnostic(prep) {
+        const kb = (bytes) => Math.round(bytes / 1024);
+        const sumBytes = (imgs) => imgs.reduce((n, im) => n + (im.source?.bytes?.byteLength ?? 0), 0);
+        const cmImgs = prep.conversationState.currentMessage?.userInputMessage?.images ?? [];
+        const history = prep.conversationState.history ?? [];
+        const histDetail = [];
+        let histImgs = 0;
+        let histKb = 0;
+        for (let i = 0; i < history.length; i++) {
+            const imgs = history[i]?.userInputMessage?.images ?? [];
+            if (imgs.length === 0)
+                continue;
+            const entryKb = kb(sumBytes(imgs));
+            histDetail.push(`i=${i}:user:${imgs.length}(${entryKb}KB)`);
+            histImgs += imgs.length;
+            histKb += entryKb;
+        }
+        const detail = histDetail.length ? ` detail=[${histDetail.join(',')}]` : '';
+        logger.log(`[IMG] convId=${prep.conversationId} cur=${cmImgs.length}(${kb(sumBytes(cmImgs))}KB)` +
+            ` hist=${histImgs}/${history.length}(${histKb}KB)${detail}`);
+    }
+    logSdkResponse(prep, timestamp) {
+        logger.logApiResponse({
+            status: 200,
+            statusText: 'OK',
+            headers: {},
+            conversationId: prep.conversationId,
+            model: prep.effectiveModel
+        }, timestamp);
+    }
+    logSdkError(prep, error, acc, apiTimestamp) {
+        const status = error?.$metadata?.httpStatusCode || 0;
+        const rData = {
+            status,
+            statusText: error?.name || 'Error',
+            headers: {},
+            error: `Kiro Error: ${status} - ${error?.message || 'Unknown'}`,
+            conversationId: prep.conversationId,
+            model: prep.effectiveModel
+        };
+        if (!this.config.enable_log_api_request) {
+            logger.logApiError({
+                url: `${prep.endpoint}/generateAssistantResponse`,
+                method: 'POST',
+                headers: {},
+                body: null,
+                conversationId: prep.conversationId,
+                model: prep.effectiveModel,
+                email: acc.email
+            }, rData, logger.getTimestamp());
+        }
+        else {
+            logger.logApiResponse(rData, apiTimestamp);
+        }
+    }
+    async triggerReauth(showToast) {
+        if (!this.client)
+            return false;
+        const cooldownRemaining = REAUTH_FAILURE_COOLDOWN_MS - (Date.now() - this.lastFailedReauthAt);
+        if (cooldownRemaining > 0) {
+            showToast('Recent re-authentication failed. Please complete authentication manually.', 'error');
+            return false;
+        }
+        if (this.reauthInFlight) {
+            return this.reauthInFlight;
+        }
+        if (!kiroDb.acquireReauthLock()) {
+            logger.warn('Reauth lock held by another instance — polling for completion');
+            showToast('Another session is re-authenticating. Please wait...', 'info');
+            const deadline = Date.now() + 10_000;
+            while (Date.now() < deadline) {
+                await this.sleep(1000);
+                if (kiroDb.isReauthLockHeld())
+                    continue;
+                this.repository.invalidateCache();
+                const accounts = await this.repository.findAll();
+                for (const acc of accounts)
+                    this.accountManager.addAccount(acc);
+                return this.hasUsableAccount(accounts);
+            }
+            showToast('Re-authentication timed out. Please try again.', 'error');
+            return false;
+        }
+        this.reauthInFlight = this.performReauth(showToast);
+        const success = await this.reauthInFlight.finally(() => {
+            this.reauthInFlight = null;
+            kiroDb.releaseReauthLock();
+        });
+        if (!success)
+            this.lastFailedReauthAt = Date.now();
+        return success;
+    }
+    async performReauth(showToast) {
+        try {
+            showToast('Session expired. Re-authenticating...', 'warning');
+            logger.warn('Reauth: starting oauth flow');
+            const withTimeout = (promise, label) => {
+                let timer;
+                return Promise.race([
+                    promise.finally(() => clearTimeout(timer)),
+                    new Promise((_, reject) => (timer = setTimeout(() => reject(new Error(`Reauth timed out waiting for ${label}`)), REAUTH_TIMEOUT_MS)))
+                ]);
+            };
+            await withTimeout(this.client.provider.oauth.authorize({ path: { id: 'kiro' }, body: { method: 0 } }), 'oauth.authorize');
+            await withTimeout(this.client.provider.oauth.callback({ path: { id: 'kiro' }, body: { method: 0 } }), 'oauth.callback');
+            this.repository.invalidateCache();
+            const accounts = await this.repository.findAll();
+            for (const acc of accounts) {
+                this.accountManager.addAccount(acc);
+            }
+            if (!this.hasUsableAccount(accounts)) {
+                logger.warn('Re-auth completed but no usable Kiro account was found');
+                showToast('Re-authentication completed but no usable Kiro account was found.', 'error');
+                return false;
+            }
+            showToast('Re-authentication successful.', 'success');
+            return true;
+        }
+        catch (e) {
+            logger.error('Re-auth failed', e instanceof Error ? e : new Error(String(e)));
+            showToast(e instanceof Error && e.message.includes('timed out')
+                ? 'Re-authentication timed out. Please try again.'
+                : 'Re-authentication failed. Please try again.', 'error');
+            return false;
+        }
+    }
+    hasUsableAccount(accounts) {
+        const now = Date.now();
+        return accounts.some((acc) => acc.isHealthy && acc.expiresAt > now && !isPermanentError(acc.unhealthyReason));
+    }
+    allAccountsPermanentlyUnhealthy() {
+        const accounts = this.accountManager.getAccounts();
+        if (accounts.length === 0) {
+            return false;
+        }
+        return accounts.every((acc) => !acc.isHealthy && isPermanentError(acc.unhealthyReason));
+    }
+    sleep(ms) {
+        return new Promise((resolve) => setTimeout(resolve, ms));
+    }
+}
